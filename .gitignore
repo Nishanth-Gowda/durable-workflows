@@ -1,0 +1,6 @@
+.DS_Store
+.env
+web/.next/
+web/node_modules/
+web/*.tsbuildinfo
+backend/engine
