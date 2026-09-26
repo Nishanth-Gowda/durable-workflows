@@ -4,9 +4,9 @@ The `text-pipeline` definition has three activities: uppercase, reverse, and SHA
 
 ## Trace one run
 
-1. Run `docker compose stop engine` and `docker compose up -d postgres`, then start only the API with `docker compose run --rm --service-ports -e ENGINE_MODE=api engine`. No worker is running yet.
+1. Run `docker compose stop engine` and `docker compose up -d mysql`, then start only the API with `docker compose run --rm --service-ports -e ENGINE_MODE=api engine`. No worker is running yet.
 2. Start a run from the Next.js console with `{"text":"hello"}`. It stays `running` because its first task is pending.
-3. In PostgreSQL, inspect `workflow_runs`, `history_events`, and `activity_tasks`. Check that the first event and task appeared together.
+3. In MySQL, inspect `workflow_runs`, `history_events`, and `activity_tasks`. Check that the first event and task appeared together.
 4. In another terminal, start a worker with `docker compose run --rm -e ENGINE_MODE=worker engine`. Refresh the run detail page. The three activity events and completion event appear in order.
 
 ## Crash and recover

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -14,16 +15,15 @@ import (
 	"time"
 
 	"example.com/durable-workflows/backend/internal/engine"
-	"github.com/jackc/pgx/v5"
 )
 
 //go:embed migrations/*.sql
 var migrations embed.FS
 
 func main() {
-	databaseURL := os.Getenv("DATABASE_URL")
+	databaseURL := os.Getenv("MYSQL_DSN")
 	if databaseURL == "" {
-		log.Fatal("DATABASE_URL is required")
+		log.Fatal("MYSQL_DSN is required")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -36,21 +36,13 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	tx, err := e.DB.Begin(ctx)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer tx.Rollback(ctx)
 	for _, statement := range strings.Split(string(schema), ";") {
 		if strings.TrimSpace(statement) == "" {
 			continue
 		}
-		if _, err := tx.Exec(ctx, statement); err != nil {
+		if _, err := e.DB.ExecContext(ctx, statement); err != nil {
 			log.Fatal(err)
 		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		log.Fatal(err)
 	}
 	mode := os.Getenv("ENGINE_MODE")
 	if mode == "" {
@@ -112,7 +104,7 @@ func main() {
 	})
 	mux.HandleFunc("GET /api/runs/{id}", func(w http.ResponseWriter, r *http.Request) {
 		run, events, err := e.GetRun(r.Context(), r.PathValue("id"))
-		if errors.Is(err, pgx.ErrNoRows) {
+		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "run not found")
 			return
 		}

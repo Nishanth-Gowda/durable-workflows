@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,14 +13,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	_ "github.com/go-sql-driver/mysql"
 )
 
 type Step struct {
 	Name string `json:"name"`
 }
-
 type Workflow struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
@@ -43,7 +42,6 @@ type Run struct {
 	CreatedAt    time.Time       `json:"created_at"`
 	UpdatedAt    time.Time       `json:"updated_at"`
 }
-
 type Event struct {
 	Sequence   int             `json:"sequence"`
 	Type       string          `json:"type"`
@@ -51,23 +49,23 @@ type Event struct {
 	Details    json.RawMessage `json:"details"`
 	OccurredAt time.Time       `json:"occurred_at"`
 }
+type Engine struct{ DB *sql.DB }
 
-type Engine struct{ DB *pgxpool.Pool }
-
-func New(ctx context.Context, databaseURL string) (*Engine, error) {
-	db, err := pgxpool.New(ctx, databaseURL)
+func New(ctx context.Context, dsn string) (*Engine, error) {
+	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, err
 	}
-	if err = db.Ping(ctx); err != nil {
+	db.SetMaxOpenConns(20)
+	db.SetMaxIdleConns(10)
+	db.SetConnMaxLifetime(3 * time.Minute)
+	if err := db.PingContext(ctx); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return &Engine{DB: db}, nil
 }
-
 func (e *Engine) Close() { e.DB.Close() }
-
 func randomID() (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -75,7 +73,6 @@ func randomID() (string, error) {
 	}
 	return hex.EncodeToString(b[:]), nil
 }
-
 func (e *Engine) Start(ctx context.Context, workflowName string, input json.RawMessage) (string, error) {
 	if workflowName != textWorkflow.Name {
 		return "", fmt.Errorf("unknown workflow: %s", workflowName)
@@ -90,29 +87,26 @@ func (e *Engine) Start(ctx context.Context, workflowName string, input json.RawM
 	if err != nil {
 		return "", err
 	}
-	tx, err := e.DB.Begin(ctx)
+	tx, err := e.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return "", err
 	}
-	defer tx.Rollback(ctx)
-	_, err = tx.Exec(ctx, `INSERT INTO workflow_runs (id, workflow_name, status, input, current_value)
-		VALUES ($1,$2,'running',$3,$4)`, id, workflowName, input, payload.Text)
-	if err != nil {
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `INSERT INTO workflow_runs (id,workflow_name,status,input,current_value) VALUES (?,?,'running',?,?)`, id, workflowName, input, payload.Text); err != nil {
 		return "", err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO history_events (run_id,sequence,type,details)
-		VALUES ($1,1,'WorkflowStarted',$2)`, id, input)
-	if err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO history_events (run_id,sequence,type,details) VALUES (?,1,'WorkflowStarted',?)`, id, input); err != nil {
 		return "", err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO activity_tasks (run_id,step_index,state) VALUES ($1,0,'pending')`, id)
-	if err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO activity_tasks (run_id,step_index,state) VALUES (?,0,'pending')`, id); err != nil {
 		return "", err
 	}
-	return id, tx.Commit(ctx)
+	return id, tx.Commit()
 }
 
-func scanRun(row pgx.Row) (Run, error) {
+type scanner interface{ Scan(...any) error }
+
+func scanRun(row scanner) (Run, error) {
 	var r Run
 	err := row.Scan(&r.ID, &r.WorkflowName, &r.Status, &r.Input, &r.CurrentValue, &r.NextStep, &r.CreatedAt, &r.UpdatedAt)
 	return r, err
@@ -121,28 +115,31 @@ func scanRun(row pgx.Row) (Run, error) {
 const runColumns = `id,workflow_name,status,input,current_value,next_step,created_at,updated_at`
 
 func (e *Engine) GetRun(ctx context.Context, id string) (Run, []Event, error) {
-	r, err := scanRun(e.DB.QueryRow(ctx, `SELECT `+runColumns+` FROM workflow_runs WHERE id=$1`, id))
+	r, err := scanRun(e.DB.QueryRowContext(ctx, `SELECT `+runColumns+` FROM workflow_runs WHERE id=?`, id))
 	if err != nil {
 		return Run{}, nil, err
 	}
-	rows, err := e.DB.Query(ctx, `SELECT sequence,type,step_name,details,occurred_at FROM history_events WHERE run_id=$1 ORDER BY sequence`, id)
+	rows, err := e.DB.QueryContext(ctx, `SELECT sequence,type,step_name,details,occurred_at FROM history_events WHERE run_id=? ORDER BY sequence`, id)
 	if err != nil {
 		return Run{}, nil, err
 	}
 	defer rows.Close()
 	events := []Event{}
 	for rows.Next() {
-		var event Event
-		if err := rows.Scan(&event.Sequence, &event.Type, &event.StepName, &event.Details, &event.OccurredAt); err != nil {
+		var ev Event
+		var step sql.NullString
+		if err := rows.Scan(&ev.Sequence, &ev.Type, &step, &ev.Details, &ev.OccurredAt); err != nil {
 			return Run{}, nil, err
 		}
-		events = append(events, event)
+		if step.Valid {
+			ev.StepName = &step.String
+		}
+		events = append(events, ev)
 	}
 	return r, events, rows.Err()
 }
-
 func (e *Engine) ListRuns(ctx context.Context) ([]Run, error) {
-	rows, err := e.DB.Query(ctx, `SELECT `+runColumns+` FROM workflow_runs ORDER BY created_at DESC LIMIT 100`)
+	rows, err := e.DB.QueryContext(ctx, `SELECT `+runColumns+` FROM workflow_runs ORDER BY created_at DESC LIMIT 100`)
 	if err != nil {
 		return nil, err
 	}
@@ -171,27 +168,33 @@ func (e *Engine) claim(ctx context.Context) (*task, error) {
 	if err != nil {
 		return nil, err
 	}
+	tx, err := e.DB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
 	var t task
-	err = e.DB.QueryRow(ctx, `WITH candidate AS (
-		SELECT id FROM activity_tasks
-		WHERE (state='pending' AND available_at<=now()) OR (state='leased' AND lease_until<now())
-		ORDER BY available_at,id FOR UPDATE SKIP LOCKED LIMIT 1
-	)
-	UPDATE activity_tasks AS t SET state='leased', attempts=attempts+1,
-		lease_token=$1,lease_until=now()+interval '30 seconds'
-	FROM candidate WHERE t.id=candidate.id
-	RETURNING t.id,t.run_id,t.step_index,t.lease_token`, token).
-		Scan(&t.ID, &t.RunID, &t.StepIndex, &t.Token)
-	if errors.Is(err, pgx.ErrNoRows) {
+	err = tx.QueryRowContext(ctx, `SELECT id,run_id,step_index FROM activity_tasks
+		WHERE (state='pending' AND available_at<=UTC_TIMESTAMP(6)) OR (state='leased' AND lease_until<UTC_TIMESTAMP(6))
+		ORDER BY available_at,id LIMIT 1 FOR UPDATE SKIP LOCKED`).Scan(&t.ID, &t.RunID, &t.StepIndex)
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	err = e.DB.QueryRow(ctx, `SELECT current_value FROM workflow_runs WHERE id=$1`, t.RunID).Scan(&t.Value)
-	return &t, err
+	t.Token = token
+	if _, err = tx.ExecContext(ctx, `UPDATE activity_tasks SET state='leased',attempts=attempts+1,lease_token=?,lease_until=DATE_ADD(UTC_TIMESTAMP(6),INTERVAL 30 SECOND) WHERE id=?`, token, t.ID); err != nil {
+		return nil, err
+	}
+	if err = tx.QueryRowContext(ctx, `SELECT current_value FROM workflow_runs WHERE id=?`, t.RunID).Scan(&t.Value); err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &t, nil
 }
-
 func execute(stepIndex int, value string) (string, error) {
 	switch stepIndex {
 	case 0:
@@ -209,95 +212,79 @@ func execute(stepIndex int, value string) (string, error) {
 		return "", fmt.Errorf("unknown step %d", stepIndex)
 	}
 }
-
 func (e *Engine) complete(ctx context.Context, t *task, output string, activityErr error) error {
-	tx, err := e.DB.Begin(ctx)
+	tx, err := e.DB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback()
 	var status, currentValue string
 	var nextStep int
-	err = tx.QueryRow(ctx, `SELECT status,current_value,next_step FROM workflow_runs WHERE id=$1 FOR UPDATE`, t.RunID).
-		Scan(&status, &currentValue, &nextStep)
-	if err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT status,current_value,next_step FROM workflow_runs WHERE id=? FOR UPDATE`, t.RunID).Scan(&status, &currentValue, &nextStep); err != nil {
 		return err
 	}
 	var attempts int
-	err = tx.QueryRow(ctx, `SELECT attempts FROM activity_tasks
-		WHERE id=$1 AND state='leased' AND lease_token=$2 AND lease_until>now() FOR UPDATE`, t.ID, t.Token).Scan(&attempts)
-	if errors.Is(err, pgx.ErrNoRows) {
+	err = tx.QueryRowContext(ctx, `SELECT attempts FROM activity_tasks WHERE id=? AND state='leased' AND lease_token=? AND lease_until>UTC_TIMESTAMP(6) FOR UPDATE`, t.ID, t.Token).Scan(&attempts)
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil
-	} // Another worker owns the expired lease.
+	}
 	if err != nil {
 		return err
 	}
 	if status != "running" || nextStep != t.StepIndex {
 		return errors.New("run/task state mismatch")
 	}
+	var sequence int
+	if err = tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM history_events WHERE run_id=?`, t.RunID).Scan(&sequence); err != nil {
+		return err
+	}
 	stepName := textWorkflow.Steps[t.StepIndex].Name
 	if activityErr != nil {
 		if attempts < 3 {
-			_, err = tx.Exec(ctx, `UPDATE activity_tasks SET state='pending',lease_token=NULL,lease_until=NULL,
-				available_at=now()+($2 * interval '1 second') WHERE id=$1`, t.ID, attempts*attempts)
-			if err != nil {
-				return err
-			}
+			_, err = tx.ExecContext(ctx, `UPDATE activity_tasks SET state='pending',lease_token=NULL,lease_until=NULL,available_at=TIMESTAMPADD(SECOND,?,UTC_TIMESTAMP(6)) WHERE id=?`, attempts*attempts, t.ID)
 		} else {
-			_, err = tx.Exec(ctx, `UPDATE activity_tasks SET state='done',lease_token=NULL,lease_until=NULL WHERE id=$1`, t.ID)
-			if err != nil {
-				return err
+			_, err = tx.ExecContext(ctx, `UPDATE activity_tasks SET state='done',lease_token=NULL,lease_until=NULL WHERE id=?`, t.ID)
+			if err == nil {
+				_, err = tx.ExecContext(ctx, `UPDATE workflow_runs SET status='failed',updated_at=UTC_TIMESTAMP(6) WHERE id=?`, t.RunID)
 			}
-			_, err = tx.Exec(ctx, `UPDATE workflow_runs SET status='failed',updated_at=now() WHERE id=$1`, t.RunID)
-			if err != nil {
-				return err
-			}
+		}
+		if err != nil {
+			return err
 		}
 		kind := "ActivityRetryScheduled"
 		if attempts >= 3 {
 			kind = "WorkflowFailed"
 		}
 		details, _ := json.Marshal(map[string]any{"error": activityErr.Error(), "attempt": attempts})
-		_, err = tx.Exec(ctx, `INSERT INTO history_events (run_id,sequence,type,step_name,details)
-			SELECT $1,COALESCE(MAX(sequence),0)+1,$2,$3,$4 FROM history_events WHERE run_id=$1`, t.RunID, kind, stepName, details)
-		if err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO history_events (run_id,sequence,type,step_name,details) VALUES (?,?,?,?,?)`, t.RunID, sequence, kind, stepName, details); err != nil {
 			return err
 		}
-		return tx.Commit(ctx)
+		return tx.Commit()
 	}
-	_, err = tx.Exec(ctx, `UPDATE activity_tasks SET state='done',lease_token=NULL,lease_until=NULL WHERE id=$1`, t.ID)
-	if err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE activity_tasks SET state='done',lease_token=NULL,lease_until=NULL WHERE id=?`, t.ID); err != nil {
 		return err
 	}
 	details, _ := json.Marshal(map[string]any{"input": currentValue, "output": output, "attempt": attempts})
-	_, err = tx.Exec(ctx, `INSERT INTO history_events (run_id,sequence,type,step_name,details)
-		SELECT $1,COALESCE(MAX(sequence),0)+1,'ActivityCompleted',$2,$3 FROM history_events WHERE run_id=$1`, t.RunID, stepName, details)
-	if err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO history_events (run_id,sequence,type,step_name,details) VALUES (?,?,'ActivityCompleted',?,?)`, t.RunID, sequence, stepName, details); err != nil {
 		return err
 	}
 	if t.StepIndex+1 < len(textWorkflow.Steps) {
-		_, err = tx.Exec(ctx, `UPDATE workflow_runs SET current_value=$2,next_step=$3,updated_at=now() WHERE id=$1`, t.RunID, output, t.StepIndex+1)
-		if err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE workflow_runs SET current_value=?,next_step=?,updated_at=UTC_TIMESTAMP(6) WHERE id=?`, output, t.StepIndex+1, t.RunID); err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO activity_tasks (run_id,step_index,state) VALUES ($1,$2,'pending')`, t.RunID, t.StepIndex+1)
-		if err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO activity_tasks (run_id,step_index,state) VALUES (?,?,'pending')`, t.RunID, t.StepIndex+1); err != nil {
 			return err
 		}
 	} else {
-		_, err = tx.Exec(ctx, `UPDATE workflow_runs SET current_value=$2,next_step=$3,status='completed',updated_at=now() WHERE id=$1`, t.RunID, output, t.StepIndex+1)
-		if err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE workflow_runs SET current_value=?,next_step=?,status='completed',updated_at=UTC_TIMESTAMP(6) WHERE id=?`, output, t.StepIndex+1, t.RunID); err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO history_events (run_id,sequence,type,details)
-			SELECT $1,COALESCE(MAX(sequence),0)+1,'WorkflowCompleted',$2 FROM history_events WHERE run_id=$1`, t.RunID, details)
-		if err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO history_events (run_id,sequence,type,details) VALUES (?,?,'WorkflowCompleted',?)`, t.RunID, sequence+1, details); err != nil {
 			return err
 		}
 	}
-	return tx.Commit(ctx)
+	return tx.Commit()
 }
-
 func (e *Engine) Work(ctx context.Context, activityDelay time.Duration) error {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()

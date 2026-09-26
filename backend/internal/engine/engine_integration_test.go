@@ -9,9 +9,9 @@ import (
 )
 
 func TestExpiredLeaseCannotCommitAndRunCompletes(t *testing.T) {
-	url := os.Getenv("TEST_DATABASE_URL")
+	url := os.Getenv("TEST_MYSQL_DSN")
 	if url == "" {
-		t.Skip("set TEST_DATABASE_URL to run PostgreSQL integration test")
+		t.Skip("set TEST_MYSQL_DSN to run MySQL integration test")
 	}
 	ctx := context.Background()
 	e, err := New(ctx, url)
@@ -27,7 +27,7 @@ func TestExpiredLeaseCannotCommitAndRunCompletes(t *testing.T) {
 		if strings.TrimSpace(statement) == "" {
 			continue
 		}
-		if _, err := e.DB.Exec(ctx, statement); err != nil {
+		if _, err := e.DB.ExecContext(ctx, statement); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -36,15 +36,15 @@ func TestExpiredLeaseCannotCommitAndRunCompletes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		_, _ = e.DB.Exec(ctx, `DELETE FROM activity_tasks WHERE run_id=$1`, id)
-		_, _ = e.DB.Exec(ctx, `DELETE FROM history_events WHERE run_id=$1`, id)
-		_, _ = e.DB.Exec(ctx, `DELETE FROM workflow_runs WHERE id=$1`, id)
+		_, _ = e.DB.ExecContext(ctx, `DELETE FROM activity_tasks WHERE run_id=?`, id)
+		_, _ = e.DB.ExecContext(ctx, `DELETE FROM history_events WHERE run_id=?`, id)
+		_, _ = e.DB.ExecContext(ctx, `DELETE FROM workflow_runs WHERE id=?`, id)
 	}()
 	stale, err := e.claim(ctx)
 	if err != nil || stale == nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if _, err := e.DB.Exec(ctx, `UPDATE activity_tasks SET lease_until=now()-interval '1 second' WHERE id=$1`, stale.ID); err != nil {
+	if _, err := e.DB.ExecContext(ctx, `UPDATE activity_tasks SET lease_until=UTC_TIMESTAMP(6)-INTERVAL 1 SECOND WHERE id=?`, stale.ID); err != nil {
 		t.Fatal(err)
 	}
 	fresh, err := e.claim(ctx)

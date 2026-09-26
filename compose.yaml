@@ -1,30 +1,31 @@
 services:
-  postgres:
-    image: postgres:17-alpine
+  mysql:
+    image: mysql:8.4
     environment:
-      POSTGRES_USER: workflow
-      POSTGRES_PASSWORD: workflow
-      POSTGRES_DB: workflows
+      MYSQL_ROOT_PASSWORD: rootworkflow
+      MYSQL_USER: workflow
+      MYSQL_PASSWORD: workflow
+      MYSQL_DATABASE: workflows
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:3306:3306"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - mysql_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U workflow -d workflows"]
-      interval: 2s
-      timeout: 2s
-      retries: 20
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uworkflow -pworkflow --silent"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
 
   engine:
     build:
       context: ./backend
     environment:
-      DATABASE_URL: postgres://workflow:workflow@postgres:5432/workflows?sslmode=disable
+      MYSQL_DSN: workflow:workflow@tcp(mysql:3306)/workflows?parseTime=true&loc=UTC&time_zone=%27%2B00%3A00%27
       ENGINE_MODE: all
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:
-      postgres:
+      mysql:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
@@ -33,4 +34,4 @@ services:
       retries: 10
 
 volumes:
-  postgres_data:
+  mysql_data:

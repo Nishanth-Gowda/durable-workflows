@@ -5,7 +5,7 @@ import { asEventDetails } from "@/lib/api";
 import { RunDetail } from "@/lib/types";
 
 const terminal = new Set(["completed", "failed", "cancelled", "canceled"]);
-const timestamp = (value: string) => new Date(value).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "medium" });
+const timestamp = (value: string) => new Date(value).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "medium", timeZone: "UTC" }) + " UTC";
 
 export function RunDetailView({ id, initial }: { id: string; initial: RunDetail }) {
   const [detail, setDetail] = useState(initial);

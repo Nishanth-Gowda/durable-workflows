@@ -1,12 +1,12 @@
 # Durable Workflows
 
-A small workflow engine built to learn durable execution. The Go service persists each run, its event history, and activity tasks in PostgreSQL. A worker claims tasks with leases; an expired lease lets another worker retry after a crash. The Next.js console shows runs and their timelines.
+A small workflow engine built to learn durable execution. The Go service persists each run, its event history, and activity tasks in MySQL. A worker claims tasks with leases; an expired lease lets another worker retry after a crash. The Next.js console shows runs and their timelines.
 
 This first milestone supports one sequential example workflow (`text-pipeline`). It does not yet provide arbitrary Go workflow functions, replay, external activities, timers, signals, or authentication.
 
 ## Run locally
 
-Requirements: Docker and Node.js 22+. The database uses the official PostgreSQL 17 image; Compose builds the Go service image from `backend/Dockerfile`.
+Requirements: Docker and Node.js 22+. The database uses the official MySQL 8.4 image; Compose builds the Go service image from `backend/Dockerfile`.
 
 ```sh
 docker compose up --build -d
@@ -31,12 +31,23 @@ curl -X POST http://localhost:8080/api/runs \
 
 Then request `GET /api/runs` or `GET /api/runs/{id}`. The engine serves the API and worker in one container by default. Use `docker compose logs -f engine` to follow task claims. Workers poll every 500 ms; leases expire after 30 seconds. Follow [LEARNING.md](LEARNING.md) for the crash experiment. `ENGINE_MODE=api` and `ENGINE_MODE=worker` can also run as separate containers or local Go processes.
 
-Run the database integration test with Go 1.24+ installed:
+Connect any MySQL client (such as MySQL Workbench or DBeaver) to host `127.0.0.1`, port `3306`, database `workflows`, username `workflow`, and password `workflow`. In the terminal, open a SQL prompt with:
 
 ```sh
-cd backend
-TEST_DATABASE_URL='postgres://workflow:workflow@localhost:5432/workflows?sslmode=disable' go test ./... -count=1 -v
+docker compose exec mysql mysql -uworkflow -p workflows
 ```
+
+Enter `workflow` when prompted. Try `SELECT * FROM workflow_runs;`, `SELECT * FROM history_events ORDER BY occurred_at DESC LIMIT 10;`, and `SELECT * FROM activity_tasks;`. These credentials are for local development only.
+
+Run the database integration test with Go 1.24+ installed. Create an isolated test database first:
+
+```sh
+docker compose exec mysql mysql -uroot -p -e 'CREATE DATABASE IF NOT EXISTS workflows_test; GRANT ALL PRIVILEGES ON workflows_test.* TO "workflow"@"%";'
+cd backend
+TEST_MYSQL_DSN='workflow:workflow@tcp(127.0.0.1:3306)/workflows_test?parseTime=true&loc=UTC&time_zone=%27%2B00%3A00%27' go test ./... -count=1 -v
+```
+
+The previous PostgreSQL Docker volume remains available for recovery, but its runs are not copied into the new MySQL database. Do not run `docker compose down -v` if you need that volume.
 
 ## Durability contract
 
