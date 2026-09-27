@@ -21,4 +21,11 @@ export type Event = {
   details?: unknown;
 };
 
-export type RunDetail = { run: Run; events: Event[] };
+export type Checkpoint = {
+  sequence: number;
+  next_step: number;
+  step_name: string | null;
+  value: string;
+};
+
+export type RunDetail = { run: Run; events: Event[]; checkpoints: Checkpoint[] };

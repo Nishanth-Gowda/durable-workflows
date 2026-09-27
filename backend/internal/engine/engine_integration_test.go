@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -95,5 +96,65 @@ func TestExpiredLeaseCannotCommitAndRunCompletes(t *testing.T) {
 	}
 	if run.Status != "completed" || len(events) != 5 {
 		t.Fatalf("status=%s events=%d", run.Status, len(events))
+	}
+	finalValue := run.CurrentValue
+	checkpoints, err := e.ListCheckpoints(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(checkpoints) != 3 || checkpoints[0].Sequence != 1 || checkpoints[1].Sequence != 2 || checkpoints[2].Sequence != 3 {
+		t.Fatalf("unexpected checkpoints: %+v", checkpoints)
+	}
+	if err := e.Reset(ctx, id, checkpoints[1].Sequence); err != nil {
+		t.Fatal(err)
+	}
+	run, events, err = e.GetRun(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != "running" || run.NextStep != 1 || run.CurrentValue != "HELLO" || len(events) != 6 || events[5].Type != "WorkflowReset" {
+		t.Fatalf("reset state: run=%+v events=%+v", run, events)
+	}
+	// Reset while a worker holds the new task. The old task ID must be
+	// invalidated, even when the run returns to the same step later.
+	staleAfterReset, err := e.claim(ctx)
+	if err != nil || staleAfterReset == nil || staleAfterReset.StepIndex != 1 {
+		t.Fatalf("claim after reset: %v %+v", err, staleAfterReset)
+	}
+	if err := e.Reset(ctx, id, checkpoints[0].Sequence); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.complete(ctx, staleAfterReset, "incorrect", nil); err != nil {
+		t.Fatal(err)
+	}
+	run, events, err = e.GetRun(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.NextStep != 0 || run.CurrentValue != "hello" || len(events) != 7 {
+		t.Fatalf("stale completion changed reset state: run=%+v events=%d", run, len(events))
+	}
+	if err := e.Reset(ctx, id, 999999); !errors.Is(err, ErrInvalidCheckpoint) {
+		t.Fatalf("invalid checkpoint: %v", err)
+	}
+	for step := 0; step < 3; step++ {
+		claimed, err := e.claim(ctx)
+		if err != nil || claimed == nil || claimed.StepIndex != step {
+			t.Fatalf("claim rerun step %d: %v %+v", step, err, claimed)
+		}
+		output, err := execute(claimed.StepIndex, claimed.Value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := e.complete(ctx, claimed, output, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run, _, err = e.GetRun(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != "completed" || run.CurrentValue != finalValue {
+		t.Fatalf("rerun failed: %+v", run)
 	}
 }

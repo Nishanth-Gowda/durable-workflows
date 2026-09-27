@@ -127,7 +127,45 @@ func main() {
 			writeError(w, http.StatusInternalServerError, "database error")
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"run": run, "events": events})
+		checkpoints, err := e.ListCheckpoints(r.Context(), run.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "database error")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"run": run, "events": events, "checkpoints": checkpoints})
+	})
+	mux.HandleFunc("POST /api/runs/{id}/reset", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			CheckpointSequence *int `json:"checkpoint_sequence"`
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.CheckpointSequence == nil || *body.CheckpointSequence < 1 {
+			writeError(w, http.StatusBadRequest, "checkpoint_sequence must be a positive integer")
+			return
+		}
+		id := r.PathValue("id")
+		if err := e.Reset(r.Context(), id, *body.CheckpointSequence); err != nil {
+			switch {
+			case errors.Is(err, sql.ErrNoRows):
+				writeError(w, http.StatusNotFound, "run not found")
+			case errors.Is(err, engine.ErrInvalidCheckpoint):
+				writeError(w, http.StatusBadRequest, err.Error())
+			default:
+				writeError(w, http.StatusInternalServerError, "database error")
+			}
+			return
+		}
+		run, events, err := e.GetRun(r.Context(), id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "database error")
+			return
+		}
+		checkpoints, err := e.ListCheckpoints(r.Context(), id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "database error")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"run": run, "events": events, "checkpoints": checkpoints})
 	})
 	server := &http.Server{Addr: ":8080", Handler: cors(mux), ReadHeaderTimeout: 5 * time.Second}
 	// Shutdown is bounded so an unresponsive connection cannot keep the process

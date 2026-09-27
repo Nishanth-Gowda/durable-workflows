@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
   workflow_name VARCHAR(128) NOT NULL,
   -- Restrict the lifecycle to states understood by the engine.
   status VARCHAR(16) NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
-  -- Keep the submitted JSON for inspection; workers use current_value.
+  -- Keep the submitted JSON for inspection. Workers use current_value.
   input JSON NOT NULL,
   -- Checkpoint passed to the next step, then the final result on completion.
   current_value TEXT NOT NULL,
