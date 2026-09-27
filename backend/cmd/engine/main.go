@@ -17,14 +17,20 @@ import (
 	"example.com/durable-workflows/backend/internal/engine"
 )
 
+// Embed migrations so the engine can initialize its schema without depending
+// on files being present in the process's working directory at runtime.
+//
 //go:embed migrations/*.sql
 var migrations embed.FS
 
 func main() {
+	// The database is required before either the worker or API can start.
 	databaseURL := os.Getenv("MYSQL_DSN")
 	if databaseURL == "" {
 		log.Fatal("MYSQL_DSN is required")
 	}
+	// One cancellation signal is shared by the worker, HTTP server, and database
+	// calls so every component begins shutting down together.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	e, err := engine.New(ctx, databaseURL)
@@ -32,6 +38,9 @@ func main() {
 		log.Fatal(err)
 	}
 	defer e.Close()
+	// Apply the embedded schema on startup. Each migration statement is executed
+	// separately because the database driver does not receive a multi-statement
+	// script here.
 	schema, err := migrations.ReadFile("migrations/001_init.sql")
 	if err != nil {
 		log.Fatal(err)
@@ -44,6 +53,8 @@ func main() {
 			log.Fatal(err)
 		}
 	}
+	// The default process runs both roles; api and worker modes support separate
+	// deployments when the roles need to scale independently.
 	mode := os.Getenv("ENGINE_MODE")
 	if mode == "" {
 		mode = "all"
@@ -52,6 +63,8 @@ func main() {
 		log.Fatal("ENGINE_MODE must be all, api, or worker")
 	}
 	if mode != "api" {
+		// A configured delay pauses after a task is claimed, making lease expiry
+		// and crash recovery observable during local experiments.
 		var activityDelay time.Duration
 		if value := os.Getenv("WORKER_ACTIVITY_DELAY"); value != "" {
 			activityDelay, err = time.ParseDuration(value)
@@ -67,9 +80,11 @@ func main() {
 		}()
 	}
 	if mode == "worker" {
+		// A worker has no HTTP listener, so it remains alive until cancellation.
 		<-ctx.Done()
 		return
 	}
+	// The API exposes health, workflow discovery, run creation, and run status.
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -115,6 +130,8 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]any{"run": run, "events": events})
 	})
 	server := &http.Server{Addr: ":8080", Handler: cors(mux), ReadHeaderTimeout: 5 * time.Second}
+	// Shutdown is bounded so an unresponsive connection cannot keep the process
+	// alive indefinitely after the shared context has been cancelled.
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -129,6 +146,7 @@ func main() {
 
 func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Allow only the local frontend origins used by development clients.
 		origin := r.Header.Get("Origin")
 		if origin == "http://localhost:3000" || origin == "http://127.0.0.1:3000" {
 			w.Header().Set("Access-Control-Allow-Origin", origin)

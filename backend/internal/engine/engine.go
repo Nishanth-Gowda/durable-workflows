@@ -19,12 +19,16 @@ import (
 type Step struct {
 	Name string `json:"name"`
 }
+
+// Workflow describes the steps exposed by the API. Execution is currently
+// defined by the matching step indexes in execute.
 type Workflow struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	Steps       []Step `json:"steps"`
 }
 
+// The engine currently supports one fixed, sequential workflow.
 var textWorkflow = Workflow{
 	Name: "text-pipeline", Description: "Uppercase text, reverse it, then calculate its SHA-256 digest.",
 	Steps: []Step{{Name: "uppercase"}, {Name: "reverse"}, {Name: "sha256"}},
@@ -32,6 +36,8 @@ var textWorkflow = Workflow{
 
 func Workflows() []Workflow { return []Workflow{textWorkflow} }
 
+// Run is the durable checkpoint for one workflow execution. CurrentValue is
+// the input to NextStep, or the final result once Status is completed.
 type Run struct {
 	ID           string          `json:"id"`
 	WorkflowName string          `json:"workflow_name"`
@@ -42,6 +48,8 @@ type Run struct {
 	CreatedAt    time.Time       `json:"created_at"`
 	UpdatedAt    time.Time       `json:"updated_at"`
 }
+
+// Event records an ordered transition in a run's history.
 type Event struct {
 	Sequence   int             `json:"sequence"`
 	Type       string          `json:"type"`
@@ -49,6 +57,8 @@ type Event struct {
 	Details    json.RawMessage `json:"details"`
 	OccurredAt time.Time       `json:"occurred_at"`
 }
+
+// Engine shares a connection pool between API requests and workers.
 type Engine struct{ DB *sql.DB }
 
 func New(ctx context.Context, dsn string) (*Engine, error) {
@@ -87,6 +97,8 @@ func (e *Engine) Start(ctx context.Context, workflowName string, input json.RawM
 	if err != nil {
 		return "", err
 	}
+	// Publish the run, its first history event, and its first task atomically.
+	// A worker can never observe a run that lacks its initial task.
 	tx, err := e.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return "", err
@@ -159,10 +171,12 @@ type task struct {
 	ID        int64
 	RunID     string
 	StepIndex int
-	Token     string
-	Value     string
+	Token     string // Fences a worker after its lease expires or is replaced.
+	Value     string // Checkpoint read when this task was claimed.
 }
 
+// claim leases one ready task. SKIP LOCKED lets other worker processes claim
+// different tasks without waiting for this transaction's row lock.
 func (e *Engine) claim(ctx context.Context) (*task, error) {
 	token, err := randomID()
 	if err != nil {
@@ -184,6 +198,7 @@ func (e *Engine) claim(ctx context.Context) (*task, error) {
 		return nil, err
 	}
 	t.Token = token
+	// Expired leases are reclaimable; every claim gets a new token and attempt.
 	if _, err = tx.ExecContext(ctx, `UPDATE activity_tasks SET state='leased',attempts=attempts+1,lease_token=?,lease_until=DATE_ADD(UTC_TIMESTAMP(6),INTERVAL 30 SECOND) WHERE id=?`, token, t.ID); err != nil {
 		return nil, err
 	}
@@ -195,6 +210,8 @@ func (e *Engine) claim(ctx context.Context) (*task, error) {
 	}
 	return &t, nil
 }
+
+// execute applies the fixed workflow definition to the saved checkpoint.
 func execute(stepIndex int, value string) (string, error) {
 	switch stepIndex {
 	case 0:
@@ -212,6 +229,9 @@ func execute(stepIndex int, value string) (string, error) {
 		return "", fmt.Errorf("unknown step %d", stepIndex)
 	}
 }
+
+// complete commits one activity transition. Locking the run serializes its
+// history sequence and checkpoint update with creation of the next task.
 func (e *Engine) complete(ctx context.Context, t *task, output string, activityErr error) error {
 	tx, err := e.DB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -226,6 +246,7 @@ func (e *Engine) complete(ctx context.Context, t *task, output string, activityE
 	var attempts int
 	err = tx.QueryRowContext(ctx, `SELECT attempts FROM activity_tasks WHERE id=? AND state='leased' AND lease_token=? AND lease_until>UTC_TIMESTAMP(6) FOR UPDATE`, t.ID, t.Token).Scan(&attempts)
 	if errors.Is(err, sql.ErrNoRows) {
+		// This worker lost its lease; a replacement may already own the task.
 		return nil
 	}
 	if err != nil {
@@ -240,6 +261,7 @@ func (e *Engine) complete(ctx context.Context, t *task, output string, activityE
 	}
 	stepName := textWorkflow.Steps[t.StepIndex].Name
 	if activityErr != nil {
+		// Back off after the first two failures, then fail the run on attempt 3.
 		if attempts < 3 {
 			_, err = tx.ExecContext(ctx, `UPDATE activity_tasks SET state='pending',lease_token=NULL,lease_until=NULL,available_at=TIMESTAMPADD(SECOND,?,UTC_TIMESTAMP(6)) WHERE id=?`, attempts*attempts, t.ID)
 		} else {
@@ -268,6 +290,7 @@ func (e *Engine) complete(ctx context.Context, t *task, output string, activityE
 	if _, err = tx.ExecContext(ctx, `INSERT INTO history_events (run_id,sequence,type,step_name,details) VALUES (?,?,'ActivityCompleted',?,?)`, t.RunID, sequence, stepName, details); err != nil {
 		return err
 	}
+	// The next task and its input checkpoint become visible together.
 	if t.StepIndex+1 < len(textWorkflow.Steps) {
 		if _, err = tx.ExecContext(ctx, `UPDATE workflow_runs SET current_value=?,next_step=?,updated_at=UTC_TIMESTAMP(6) WHERE id=?`, output, t.StepIndex+1, t.RunID); err != nil {
 			return err
@@ -285,6 +308,9 @@ func (e *Engine) complete(ctx context.Context, t *task, output string, activityE
 	}
 	return tx.Commit()
 }
+
+// Work polls for tasks and executes them serially within this process.
+// Additional worker processes can claim other tasks concurrently.
 func (e *Engine) Work(ctx context.Context, activityDelay time.Duration) error {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
@@ -303,6 +329,7 @@ func (e *Engine) Work(ctx context.Context, activityDelay time.Duration) error {
 		}
 		log.Printf("claimed run=%s step=%d task=%d", t.RunID, t.StepIndex, t.ID)
 		if activityDelay > 0 {
+			// This optional pause makes lease recovery observable in the demo.
 			select {
 			case <-ctx.Done():
 				return nil

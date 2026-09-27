@@ -9,6 +9,8 @@ import (
 )
 
 func TestExpiredLeaseCannotCommitAndRunCompletes(t *testing.T) {
+	// The test requires a real MySQL instance because lease expiry and
+	// completion are both validated through database updates.
 	url := os.Getenv("TEST_MYSQL_DSN")
 	if url == "" {
 		t.Skip("set TEST_MYSQL_DSN to run MySQL integration test")
@@ -31,6 +33,7 @@ func TestExpiredLeaseCannotCommitAndRunCompletes(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// Start one three-step workflow and keep the run ID for cleanup below.
 	id, err := e.Start(ctx, "text-pipeline", json.RawMessage(`{"text":"hello"}`))
 	if err != nil {
 		t.Fatal(err)
@@ -40,6 +43,8 @@ func TestExpiredLeaseCannotCommitAndRunCompletes(t *testing.T) {
 		_, _ = e.DB.ExecContext(ctx, `DELETE FROM history_events WHERE run_id=?`, id)
 		_, _ = e.DB.ExecContext(ctx, `DELETE FROM workflow_runs WHERE id=?`, id)
 	}()
+	// Claim the first task, then force its lease to expire so another worker
+	// can reclaim it with a new token.
 	stale, err := e.claim(ctx)
 	if err != nil || stale == nil {
 		t.Fatalf("claim: %v", err)
@@ -54,6 +59,7 @@ func TestExpiredLeaseCannotCommitAndRunCompletes(t *testing.T) {
 	if fresh.Token == stale.Token {
 		t.Fatal("reclaim reused lease token")
 	}
+	// A worker holding the expired token must not be able to advance the run.
 	if err := e.complete(ctx, stale, "incorrect", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -64,6 +70,7 @@ func TestExpiredLeaseCannotCommitAndRunCompletes(t *testing.T) {
 	if run.NextStep != 0 || len(events) != 1 {
 		t.Fatalf("stale worker changed run: step=%d events=%d", run.NextStep, len(events))
 	}
+	// Complete the reclaimed first task and the remaining two tasks normally.
 	for step := 0; step < 3; step++ {
 		var task *task
 		if step == 0 {
