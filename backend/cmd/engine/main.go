@@ -2,9 +2,7 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"embed"
-	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
@@ -15,6 +13,9 @@ import (
 	"time"
 
 	"example.com/durable-workflows/backend/internal/engine"
+	"example.com/durable-workflows/backend/internal/handlers"
+	"example.com/durable-workflows/backend/internal/routers"
+	"example.com/durable-workflows/backend/internal/service"
 )
 
 // Embed migrations so the engine can initialize its schema without depending
@@ -84,90 +85,7 @@ func main() {
 		<-ctx.Done()
 		return
 	}
-	// The API exposes health, workflow discovery, run creation, and run status.
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
-	mux.HandleFunc("GET /api/workflows", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"workflows": engine.Workflows()})
-	})
-	mux.HandleFunc("POST /api/runs", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			WorkflowName string          `json:"workflow_name"`
-			Input        json.RawMessage `json:"input"`
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid JSON")
-			return
-		}
-		id, err := e.Start(r.Context(), body.WorkflowName, body.Input)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		writeJSON(w, http.StatusCreated, map[string]string{"run_id": id})
-	})
-	mux.HandleFunc("GET /api/runs", func(w http.ResponseWriter, r *http.Request) {
-		runs, err := e.ListRuns(r.Context())
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "database error")
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"runs": runs})
-	})
-	mux.HandleFunc("GET /api/runs/{id}", func(w http.ResponseWriter, r *http.Request) {
-		run, events, err := e.GetRun(r.Context(), r.PathValue("id"))
-		if errors.Is(err, sql.ErrNoRows) {
-			writeError(w, http.StatusNotFound, "run not found")
-			return
-		}
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "database error")
-			return
-		}
-		checkpoints, err := e.ListCheckpoints(r.Context(), run.ID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "database error")
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"run": run, "events": events, "checkpoints": checkpoints})
-	})
-	mux.HandleFunc("POST /api/runs/{id}/reset", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			CheckpointSequence *int `json:"checkpoint_sequence"`
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.CheckpointSequence == nil || *body.CheckpointSequence < 1 {
-			writeError(w, http.StatusBadRequest, "checkpoint_sequence must be a positive integer")
-			return
-		}
-		id := r.PathValue("id")
-		if err := e.Reset(r.Context(), id, *body.CheckpointSequence); err != nil {
-			switch {
-			case errors.Is(err, sql.ErrNoRows):
-				writeError(w, http.StatusNotFound, "run not found")
-			case errors.Is(err, engine.ErrInvalidCheckpoint):
-				writeError(w, http.StatusBadRequest, err.Error())
-			default:
-				writeError(w, http.StatusInternalServerError, "database error")
-			}
-			return
-		}
-		run, events, err := e.GetRun(r.Context(), id)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "database error")
-			return
-		}
-		checkpoints, err := e.ListCheckpoints(r.Context(), id)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "database error")
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"run": run, "events": events, "checkpoints": checkpoints})
-	})
-	server := &http.Server{Addr: ":8080", Handler: cors(mux), ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{Addr: ":8080", Handler: routers.New(handlers.New(service.New(e))), ReadHeaderTimeout: 5 * time.Second}
 	// Shutdown is bounded so an unresponsive connection cannot keep the process
 	// alive indefinitely after the shared context has been cancelled.
 	go func() {
@@ -180,35 +98,4 @@ func main() {
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
-}
-
-func cors(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Allow only the local frontend origins used by development clients.
-		origin := r.Header.Get("Origin")
-		if origin == "http://localhost:3000" || origin == "http://127.0.0.1:3000" {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Vary", "Origin")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		}
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		if strings.HasPrefix(r.URL.Path, "/api/") {
-			w.Header().Set("Cache-Control", "no-store")
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
-}
-
-func writeError(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, map[string]string{"error": message})
 }

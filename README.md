@@ -41,6 +41,14 @@ curl -X POST http://localhost:8080/api/runs/RUN_ID/reset \
 
 The run resumes at that checkpoint's next activity. Its old events remain in the audit timeline, and the reset adds a `WorkflowReset` event. Workers holding tasks from before the reset cannot commit them.
 
+## Backend layout
+
+- `backend/cmd/engine/main.go` starts the database, worker, and HTTP server.
+- `backend/internal/routers` registers routes and applies HTTP middleware.
+- `backend/internal/handlers` parses requests and writes HTTP responses.
+- `backend/internal/service` coordinates run operations and builds run details.
+- `backend/internal/engine` owns workflow state, persistence, checkpoints, and worker execution.
+
 Connect any MySQL client (such as MySQL Workbench or DBeaver) to host `127.0.0.1`, port `3306`, database `workflows`, username `workflow`, and password `workflow`. In the terminal, open a SQL prompt with:
 
 ```sh
