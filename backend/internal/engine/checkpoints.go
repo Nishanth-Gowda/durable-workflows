@@ -43,6 +43,13 @@ func checkpointFromEvent(ev Event) (Checkpoint, bool, error) {
 // ListCheckpoints returns all restartable snapshots, including snapshots from
 // earlier attempts. The final result is omitted because no activity follows it.
 func (e *Engine) ListCheckpoints(ctx context.Context, id string) ([]Checkpoint, error) {
+	var workflowName string
+	if err := e.DB.QueryRowContext(ctx, `SELECT workflow_name FROM workflow_runs WHERE id=?`, id).Scan(&workflowName); err != nil {
+		return nil, err
+	}
+	if workflowName == branchingWorkflow.Name {
+		return []Checkpoint{}, nil
+	}
 	rows, err := e.DB.QueryContext(ctx, `SELECT sequence,type,step_name,details,occurred_at FROM history_events WHERE run_id=? ORDER BY sequence`, id)
 	if err != nil {
 		return nil, err
@@ -81,8 +88,12 @@ func (e *Engine) Reset(ctx context.Context, id string, checkpointSequence int) e
 	defer tx.Rollback()
 	var previousStatus, previousValue string
 	var previousStep int
-	if err := tx.QueryRowContext(ctx, `SELECT status,current_value,next_step FROM workflow_runs WHERE id=? FOR UPDATE`, id).Scan(&previousStatus, &previousValue, &previousStep); err != nil {
+	var workflowName string
+	if err := tx.QueryRowContext(ctx, `SELECT workflow_name,status,current_value,next_step FROM workflow_runs WHERE id=? FOR UPDATE`, id).Scan(&workflowName, &previousStatus, &previousValue, &previousStep); err != nil {
 		return err
+	}
+	if workflowName == branchingWorkflow.Name {
+		return ErrInvalidCheckpoint
 	}
 	var ev Event
 	var step sql.NullString

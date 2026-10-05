@@ -43,6 +43,22 @@ func (e *Engine) claim(ctx context.Context) (*task, error) {
 	if err = tx.QueryRowContext(ctx, `SELECT current_value FROM workflow_runs WHERE id=?`, t.RunID).Scan(&t.Value); err != nil {
 		return nil, err
 	}
+	if err = tx.QueryRowContext(ctx, `SELECT workflow_name FROM workflow_runs WHERE id=?`, t.RunID).Scan(&t.WorkflowName); err != nil {
+		return nil, err
+	}
+	if t.WorkflowName == branchingWorkflow.Name {
+		var details json.RawMessage
+		if err = tx.QueryRowContext(ctx, `SELECT step_name,details FROM history_events WHERE run_id=? AND type='ActivityScheduled' ORDER BY sequence DESC LIMIT 1`, t.RunID).Scan(&t.ActivityName, &details); err != nil {
+			return nil, err
+		}
+		var scheduled struct {
+			Input string `json:"input"`
+		}
+		if err = json.Unmarshal(details, &scheduled); err != nil {
+			return nil, err
+		}
+		t.Value = scheduled.Input
+	}
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -71,6 +87,9 @@ func execute(stepIndex int, value string) (string, error) {
 // complete commits one activity transition. Locking the run serializes its
 // history sequence and checkpoint update with creation of the next task.
 func (e *Engine) complete(ctx context.Context, t *task, output string, activityErr error) error {
+	if t.WorkflowName == branchingWorkflow.Name {
+		return e.completeBranch(ctx, t, output, activityErr)
+	}
 	tx, err := e.DB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return err
@@ -158,6 +177,11 @@ func (e *Engine) Work(ctx context.Context, activityDelay time.Duration) error {
 			return nil
 		case <-ticker.C:
 		}
+		if processed, err := e.processBranchWorkflowTask(ctx); err != nil {
+			return err
+		} else if processed {
+			continue
+		}
 		t, err := e.claim(ctx)
 		if err != nil {
 			return err
@@ -174,7 +198,13 @@ func (e *Engine) Work(ctx context.Context, activityDelay time.Duration) error {
 			case <-time.After(activityDelay):
 			}
 		}
-		output, activityErr := execute(t.StepIndex, t.Value)
+		var output string
+		var activityErr error
+		if t.WorkflowName == branchingWorkflow.Name {
+			output, activityErr = executeBranch(t)
+		} else {
+			output, activityErr = execute(t.StepIndex, t.Value)
+		}
 		if err := e.complete(ctx, t, output, activityErr); err != nil {
 			return err
 		}
