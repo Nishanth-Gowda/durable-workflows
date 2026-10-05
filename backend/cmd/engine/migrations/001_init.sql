@@ -10,6 +10,8 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
   -- Checkpoint passed to the next step, then the final result on completion.
   current_value TEXT NOT NULL,
   next_step INT NOT NULL DEFAULT 0,
+  -- A committed activity result wakes deterministic workflow replay.
+  replay_pending BOOLEAN NOT NULL DEFAULT FALSE,
   created_at DATETIME(6) NOT NULL DEFAULT (UTC_TIMESTAMP(6)),
   updated_at DATETIME(6) NOT NULL DEFAULT (UTC_TIMESTAMP(6))
 ) ENGINE=InnoDB;

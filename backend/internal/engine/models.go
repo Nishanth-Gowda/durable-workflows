@@ -9,8 +9,8 @@ type Step struct {
 	Name string `json:"name"`
 }
 
-// Workflow describes the steps exposed by the API. Execution is currently
-// defined by the matching step indexes in execute.
+// Workflow describes the activities shown by the API. Branching workflow
+// decisions live in Go code, so this list does not prescribe execution order.
 type Workflow struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
@@ -23,7 +23,12 @@ var textWorkflow = Workflow{
 	Steps: []Step{{Name: "uppercase"}, {Name: "reverse"}, {Name: "sha256"}},
 }
 
-func Workflows() []Workflow { return []Workflow{textWorkflow} }
+var branchingWorkflow = Workflow{
+	Name: "branching-text", Description: "Uppercase text, then choose reverse or SHA-256 in Go workflow code.",
+	Steps: []Step{{Name: "uppercase"}, {Name: "reverse"}, {Name: "sha256"}},
+}
+
+func Workflows() []Workflow { return []Workflow{textWorkflow, branchingWorkflow} }
 
 // Run is the durable checkpoint for one workflow execution. CurrentValue is
 // the input to NextStep, or the final result once Status is completed.
@@ -57,11 +62,13 @@ type Checkpoint struct {
 }
 
 type task struct {
-	ID        int64
-	RunID     string
-	StepIndex int
-	Token     string // Fences a worker after its lease expires or is replaced.
-	Value     string // Checkpoint read when this task was claimed.
+	ID           int64
+	RunID        string
+	StepIndex    int
+	WorkflowName string
+	ActivityName string
+	Token        string // Fences a worker after its lease expires or is replaced.
+	Value        string // Checkpoint read when this task was claimed.
 }
 
 type scanner interface{ Scan(...any) error }

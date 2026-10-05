@@ -54,6 +54,9 @@ func main() {
 			log.Fatal(err)
 		}
 	}
+	if err := e.EnsureReplaySchema(ctx); err != nil {
+		log.Fatal(err)
+	}
 	// The default process runs both roles; api and worker modes support separate
 	// deployments when the roles need to scale independently.
 	mode := os.Getenv("ENGINE_MODE")

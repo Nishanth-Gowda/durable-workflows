@@ -10,7 +10,7 @@ import (
 )
 
 func (e *Engine) Start(ctx context.Context, workflowName string, input json.RawMessage) (string, error) {
-	if workflowName != textWorkflow.Name {
+	if workflowName != textWorkflow.Name && workflowName != branchingWorkflow.Name {
 		return "", fmt.Errorf("unknown workflow: %s", workflowName)
 	}
 	var payload struct {
@@ -18,6 +18,9 @@ func (e *Engine) Start(ctx context.Context, workflowName string, input json.RawM
 	}
 	if err := json.Unmarshal(input, &payload); err != nil || strings.TrimSpace(payload.Text) == "" {
 		return "", errors.New("input.text must be a non-empty string")
+	}
+	if workflowName == branchingWorkflow.Name {
+		return e.startBranch(ctx, workflowName, input, payload.Text)
 	}
 	id, err := randomID()
 	if err != nil {

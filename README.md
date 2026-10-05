@@ -2,7 +2,7 @@
 
 A small workflow engine built to learn durable execution. The Go service persists each run, its event history, and activity tasks in MySQL. A worker claims tasks with leases; an expired lease lets another worker retry after a crash. The Next.js console shows runs and their timelines.
 
-This first milestone supports one sequential example workflow (`text-pipeline`) and resetting a run from a saved checkpoint. It does not yet provide arbitrary Go workflow functions, deterministic code replay, external activities, timers, signals, or authentication.
+The original sequential example (`text-pipeline`) still supports resetting a run from a saved checkpoint. The new `branching-text` example is authored as a Go function: it uppercases the input, then chooses reverse for text of at most 12 runes or SHA-256 for longer text. Its worker replays recorded activity results after a restart. This is a small replay milestone, not yet a full Temporal-style SDK with arbitrary registered workflow functions, timers, signals, child workflows, or authentication.
 
 ## Run locally
 
@@ -31,7 +31,9 @@ curl -X POST http://localhost:8080/api/runs \
 
 Then request `GET /api/runs` or `GET /api/runs/{id}`. The engine serves the API and worker in one container by default. Use `docker compose logs -f engine` to follow task claims. Workers poll every 500 ms; leases expire after 30 seconds. Follow [LEARNING.md](LEARNING.md) for the crash experiment. `ENGINE_MODE=api` and `ENGINE_MODE=worker` can also run as separate containers or local Go processes.
 
-The run detail page lists saved checkpoints. To reset through the API, first read `GET /api/runs/{id}` and choose a `checkpoints[].sequence`, then send:
+To try the code-defined branch, start `branching-text` with the same `{ "text": "hello" }` input. The history will show `ActivityScheduled(uppercase)`, its recorded completion, and then `ActivityScheduled(reverse)`. Use a longer string to choose `sha256`. After each activity completion, the database records a replay wakeup in the same transaction. A new worker can replay the Go function, read the completed activity's saved output, and schedule the chosen next activity without rerunning the completed one.
+
+The `text-pipeline` run detail page lists saved checkpoints. To reset it through the API, first read `GET /api/runs/{id}` and choose a `checkpoints[].sequence`, then send:
 
 ```sh
 curl -X POST http://localhost:8080/api/runs/RUN_ID/reset \
@@ -40,6 +42,8 @@ curl -X POST http://localhost:8080/api/runs/RUN_ID/reset \
 ```
 
 The run resumes at that checkpoint's next activity. Its old events remain in the audit timeline, and the reset adds a `WorkflowReset` event. Workers holding tasks from before the reset cannot commit them.
+
+Manual reset is not available for `branching-text`. Its normal crash recovery uses event replay. Resetting a replayed workflow would require separate execution generations so old activity completions are not consumed again.
 
 ## Backend layout
 
@@ -69,12 +73,13 @@ The previous PostgreSQL Docker volume remains available for recovery, but its ru
 
 ## Durability contract
 
-- Starting a run writes its initial event and first task in one transaction.
-- Finishing an activity writes its result, updates the run, and creates the next task in one transaction.
+- Starting `text-pipeline` writes its initial event and first task in one transaction. Starting `branching-text` writes its initial event and a replay wakeup in one transaction.
+- For `text-pipeline`, finishing an activity writes its result, updates the run, and creates the next task in one transaction.
+- For `branching-text`, finishing an activity writes its result and a durable replay wakeup in one transaction. The workflow worker replays the Go function and creates the next task in another transaction.
 - A lease token fences a worker whose claim has expired.
 - Resetting a run restores the value saved by a selected history checkpoint and replaces its task in one transaction.
-- External side effects will need idempotency keys when external activities are added. The engine cannot make an arbitrary network call exactly once.
+- External side effects will need idempotency keys when external activities are added. A worker can repeat an activity if it crashes after making an external call but before committing `ActivityCompleted`.
 
 ## Next milestones
 
-Add configurable activity handlers and explicit failure injection; add durable timers and signals; then implement deterministic workflow code replay and definition versioning.
+Add workflow and activity registration, immutable activity IDs and payloads, and definition versioning; then add durable timers and signals. The branching example demonstrates deterministic replay for one Go workflow function, but the runtime does not yet expose a general SDK.
